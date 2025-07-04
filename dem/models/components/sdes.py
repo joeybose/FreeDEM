@@ -42,6 +42,19 @@ class VEReverseSDE(torch.nn.Module):
         g = self.noise_schedule.g(t)
         return g.unsqueeze(1) if g.ndim > 0 else torch.full_like(x, g)
 
+class ReverseODE(torch.nn.Module):
+    def __init__(self, drift, noise_schedule):
+        super().__init__()
+        self.drift = drift
+        self.noise_schedule = noise_schedule
+    
+    def f(self, t, x):
+        with torch.enable_grad():
+            if t.dim() == 0:
+                # repeat the same time for all points if we have a scalar time
+                t = t * torch.ones(x.shape[0]).to(x.device)
+
+            return self.drift(t, x)
 
 class RegVEReverseSDE(VEReverseSDE):
     def f(self, t, x):

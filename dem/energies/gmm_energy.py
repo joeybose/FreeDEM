@@ -11,7 +11,126 @@ from dem.energies.base_energy_function import BaseEnergyFunction
 from dem.models.components.replay_buffer import ReplayBuffer
 from dem.utils.logging_utils import fig_to_image
 
+import torch.nn as nn
+import torch.nn.functional as f
+from typing import Optional, Dict
+from fab.types_ import LogProbFunc
+from fab.target_distributions.base import TargetDistribution
+from fab.utils.numerical import MC_estimate_true_expectation, importance_weighted_expectation, effective_sample_size_over_p
 
+def setup_quadratic_function(x: torch.Tensor, seed: int = 0):
+    # Useful for porting this problem to non torch libraries.
+    torch.random.manual_seed(seed)
+    # example function that we may want to calculate expectations over
+    x_shift = 2 * torch.randn(x.shape[-1]).to(x.device)
+    A = 2 * torch.rand((x.shape[-1], x.shape[-1])).to(x.device)
+    b = torch.rand(x.shape[-1]).to(x.device)
+    torch.seed()  # set back to random number
+    if x.dtype == torch.float64:
+        return x_shift.double(), A.double(), b.double()
+    else:
+        assert x.dtype == torch.float32
+        return x_shift, A, b
+
+
+def quadratic_function(x: torch.Tensor, seed: int = 0):
+    x_shift, A, b = setup_quadratic_function(x, seed)
+    x = x + x_shift
+    return torch.einsum("bi,ij,bj->b", x, A, x) + torch.einsum("i,bi->b", b, x)
+
+class GMMGPU(nn.Module, TargetDistribution):
+    def __init__(self, dim, n_mixes, loc_scaling, log_var_scaling=0.1, seed=0,
+                 n_test_set_samples=1000, use_gpu=True,
+                 true_expectation_estimation_n_samples=int(1e7)):
+        super(GMMGPU, self).__init__()
+        self.seed = seed
+        self.n_mixes = n_mixes
+        self.dim = dim
+        self.n_test_set_samples = n_test_set_samples
+
+        device = "cuda"
+        mean = (torch.rand((n_mixes, dim), device=device) - 0.5)*2 * loc_scaling
+        log_var = torch.ones((n_mixes, dim), device=device) * log_var_scaling
+        self.register_buffer("cat_probs", torch.ones(n_mixes).to(device))
+        self.register_buffer("locs", mean)
+        self.register_buffer("scale_trils", torch.diag_embed(f.softplus(log_var)))
+        self.expectation_function = quadratic_function
+        self.register_buffer("true_expectation", MC_estimate_true_expectation(self,
+                                                             self.expectation_function,
+                                                             true_expectation_estimation_n_samples
+                                                                              ))
+        self.device = device 
+        self.to(self.device)
+
+    def to(self, device):
+        if device == "cuda":
+            if torch.cuda.is_available():
+                self.cuda()
+        else:
+            self.cpu()
+
+    @property
+    def distribution(self):
+        mix = torch.distributions.Categorical(self.cat_probs)
+        com = torch.distributions.MultivariateNormal(self.locs,
+                                                     scale_tril=self.scale_trils,
+                                                     validate_args=False)
+        return torch.distributions.MixtureSameFamily(mixture_distribution=mix,
+                                                     component_distribution=com,
+                                                     validate_args=False)
+
+    @property
+    def test_set(self) -> torch.Tensor:
+        return self.sample((self.n_test_set_samples, ))
+
+    def log_prob(self, x: torch.Tensor):
+        # print(x.device)
+        log_prob = self.distribution.log_prob(x)
+        # Very low probability samples can cause issues (we turn off validate_args of the
+        # distribution object which typically raises an expection related to this.
+        # We manually decrease the distributions log prob to prevent them having an effect on
+        # the loss/buffer.
+        # Use torch.where instead of boolean indexing for vmap compatibility
+        log_prob = torch.where(
+            log_prob < -1e4,
+            log_prob - torch.tensor(float("inf"), device=log_prob.device, dtype=log_prob.dtype),
+            log_prob
+        )
+        return log_prob
+
+    def sample(self, shape=(1,)):
+        return self.distribution.sample(shape)
+
+    def evaluate_expectation(self, samples, log_w):
+        expectation = importance_weighted_expectation(self.expectation_function,
+                                                         samples, log_w)
+        true_expectation = self.true_expectation.to(expectation.device)
+        bias_normed = (expectation - true_expectation) / true_expectation
+        return bias_normed
+
+    def performance_metrics(self, samples: torch.Tensor, log_w: torch.Tensor,
+                            log_q_fn: Optional[LogProbFunc] = None,
+                            batch_size: Optional[int] = None) -> Dict:
+        bias_normed = self.evaluate_expectation(samples, log_w)
+        bias_no_correction = self.evaluate_expectation(samples, torch.ones_like(log_w))
+        if log_q_fn:
+            log_q_test = log_q_fn(self.test_set)
+            log_p_test = self.log_prob(self.test_set)
+            test_mean_log_prob = torch.mean(log_q_test)
+            kl_forward = torch.mean(log_p_test - log_q_test)
+            ess_over_p = effective_sample_size_over_p(log_p_test - log_q_test)
+            summary_dict = {
+                "test_set_mean_log_prob": test_mean_log_prob.cpu().item(),
+                "bias_normed": torch.abs(bias_normed).cpu().item(),
+                "bias_no_correction": torch.abs(bias_no_correction).cpu().item(),
+                "ess_over_p": ess_over_p.detach().cpu().item(),
+                "kl_forward": kl_forward.detach().cpu().item()
+                            }
+        else:
+            summary_dict = {"bias_normed": bias_normed.cpu().item(),
+                            "bias_no_correction": torch.abs(bias_no_correction).cpu().item()}
+        return summary_dict
+    
 class GMM(BaseEnergyFunction):
     def __init__(
         self,
@@ -30,9 +149,10 @@ class GMM(BaseEnergyFunction):
         val_set_size=2000,
         data_path_train=None,
     ):
-        use_gpu = device != "cpu"
+        # use_gpu = device != "cpu"
+        use_gpu = True
         torch.manual_seed(0)  # seed of 0 for GMM problem
-        self.gmm = gmm.GMM(
+        self.gmm = GMMGPU(
             dim=dimensionality,
             n_mixes=n_mixes,
             loc_scaling=loc_scaling,
