@@ -154,6 +154,52 @@ def integrate_sde(
 
     return samples
 
+def integrate_sde_with_weight(
+    sde: VEReverseSDE,
+    ode: ReverseODE,
+    x0: torch.Tensor,
+    w0: torch.Tensor,
+    num_integration_steps: int,
+    energy_function: BaseEnergyFunction,
+    reverse_time: bool = True,
+    diffusion_scale=1.0,
+    no_grad=True,
+    time_range=1.0,
+    negative_time=False,
+    num_negative_time_steps=100,
+    clipper=None,
+):
+    start_time = time_range if reverse_time else 0.0
+    end_time = time_range - start_time
+
+    times = torch.linspace(start_time, end_time, num_integration_steps + 1, device=x0.device)[:-1]
+
+    x = x0
+    samples = []
+    weights = []
+    w = w0
+    samples.append(x)
+    weights.append(w)
+    
+    with conditional_no_grad(no_grad):
+        for t in times:
+            x, f = euler_maruyama_step(
+                sde, t, x, time_range / num_integration_steps, diffusion_scale
+            )
+            if energy_function.is_molecule:
+                x = remove_mean(x, energy_function.n_particles, energy_function.n_spatial_dim)
+            samples.append(x)
+
+    samples = torch.stack(samples)
+    if negative_time:
+        print("doing negative time descent...")
+        samples_langevin = negative_time_descent(
+            x, energy_function, num_steps=num_negative_time_steps, clipper=clipper
+        )
+        samples = torch.concatenate((samples, samples_langevin), axis=0)
+
+    return samples
+
 # Compute the Importance Sampling Weight
 def compute_importance_sampling_weight(x, energy_function):
     log_target = energy_function.log_prob(x)
