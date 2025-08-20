@@ -266,6 +266,83 @@ class MyMLP(nn.Module):
 
         return x
 
+class MyMLPDualOutput(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int = 128,
+        hidden_layers: int = 3,
+        emb_size: int = 128,
+        vectorfield_dim: int = 2,  # Configurable vector field dimension
+        time_emb: str = "sinusoidal",
+        input_emb: str = "sinusoidal",
+        add_t_emb: bool = False,
+        concat_t_emb: bool = False,
+        input_dim: int = 2,
+        energy_function=None,
+    ):
+        super().__init__()
+
+        self.add_t_emb = add_t_emb
+        self.concat_t_emb = concat_t_emb
+        self.vectorfield_dim = vectorfield_dim
+
+        self.time_mlp = PositionalEmbedding(emb_size, time_emb)
+
+        positional_embeddings = []
+        for i in range(input_dim):
+            embedding = PositionalEmbedding(emb_size, input_emb, scale=25.0)
+            self.add_module(f"input_mlp{i}", embedding)
+            positional_embeddings.append(embedding)
+
+        self.channels = 1
+        self.self_condition = False
+        concat_size = len(self.time_mlp.layer) + sum(
+            map(lambda x: len(x.layer), positional_embeddings)
+        )
+
+        # Shared backbone layers
+        backbone_layers = [nn.Linear(concat_size, hidden_size)]
+        for _ in range(hidden_layers):
+            backbone_layers.append(Block(hidden_size, emb_size, add_t_emb, concat_t_emb))
+
+        self.backbone_layers = backbone_layers
+        self.joint_mlp = nn.Sequential(*backbone_layers)
+        # Two separate output heads
+        in_size = emb_size + hidden_size if concat_t_emb else hidden_size
+        
+        # Vector field head (outputs the vector field x)
+        self.vectorfield_head = nn.Linear(in_size, vectorfield_dim)
+        
+        # Scalar weight head (outputs g_t)
+        self.scalar_head = nn.Linear(in_size, 1)
+
+    def forward(self, t, x, x_self_cond=False):
+        positional_embs = [
+            self.get_submodule(f"input_mlp{i}")(x[:, i]) for i in range(x.shape[-1])
+        ]
+
+        t_emb = self.time_mlp(t.squeeze())
+        x = torch.cat((*positional_embs, t_emb), dim=-1)
+        # Forward through shared backbone
+        for i, layer in enumerate(self.backbone_layers):
+            if i == 0:
+                x = nn.GELU()(layer(x))
+                if self.add_t_emb:
+                    x = x + t_emb
+            else:
+                x = layer(x, t_emb)
+
+        # Prepare input for output heads
+        if self.concat_t_emb:
+            head_input = torch.cat([x, t_emb], dim=-1)
+        else:
+            head_input = x
+        # Compute both outputs
+        vectorfield_output = self.vectorfield_head(head_input)
+        scalar_weight = self.scalar_head(head_input).squeeze()
+
+        return vectorfield_output, scalar_weight
+
 
 class MyMLPNoSpaceEmbedding(nn.Module):
     def __init__(
@@ -422,7 +499,6 @@ class MyMLP6dim(nn.Module):
         x = torch.cat((x1_emb, x2_emb, x3_emb, x4_emb, x5_emb, x6_emb, t_emb), dim=-1)
         x = self.joint_mlp(x)
         return x
-
 
 class SpectralNormMLP(nn.Module):
     def __init__(

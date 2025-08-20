@@ -1,3 +1,4 @@
+import abc
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -5,6 +6,12 @@ import torch
 
 
 class BaseNoiseSchedule(ABC):
+    def __call__(self, x):
+        outf = self.tt(x)
+        doutf = self.dtt(x)
+        
+        return outf, doutf
+    
     @abstractmethod
     def g(t):
         # Returns g(t)
@@ -15,10 +22,19 @@ class BaseNoiseSchedule(ABC):
         # Returns \int_0^t g(t)^2 dt
         pass
 
+    @abc.abstractmethod
+    def tt(self, x): 
+        pass
+
+    @abc.abstractmethod
+    def dtt(self, x): 
+        pass
+
 
 class LinearNoiseSchedule(BaseNoiseSchedule):
     def __init__(self, beta):
         self.beta = beta
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def g(self, t):
         return torch.full_like(t, self.beta**0.5)
@@ -26,6 +42,13 @@ class LinearNoiseSchedule(BaseNoiseSchedule):
     def h(self, t):
         return self.beta * t
 
+    def tt(self, t):
+        out = t 
+        return out
+
+    def dtt(self, t):
+        out = torch.tensor(1.0).to(self.device)
+        return out
 
 class QuadraticNoiseSchedule(BaseNoiseSchedule):
     def __init__(self, beta):
